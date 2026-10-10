@@ -1,0 +1,69 @@
+{
+  "format": "quantcraft-runnable-v1",
+  "createdAt": "2026-06-18T14:11:46.092Z",
+  "entryModulePath": "smoke_test",
+  "entryFlatFilename": "smoke_test.py",
+  "files": [
+    {
+      "modulePath": "smoke_test",
+      "flatFilename": "smoke_test.py",
+      "content": "\"\"\"MA from Backtrader SMA, plotted via chart_indicators (same time keys as OHLCV bars).\"\"\"\n\nfrom __future__ import annotations\n\nimport math\nfrom typing import Any\n\nimport backtrader as bt\nimport pandas as pd\n\nimport quantcraft.backtest.runtime as rt\nfrom quantcraft.backtest.indicator_series import coerce_chart_time\nfrom quantcraft.inputs import params\n\n\nPERIOD = params.PERIOD if hasattr(params, \"PERIOD\") else 45\nMAX_OPEN_LONGS = params.MAX_OPEN_LONGS if hasattr(params, \"MAX_OPEN_LONGS\") else 5\nRISK_PERCENT = params.RISK_PERCENT if hasattr(params, \"RISK_PERCENT\") else 10.0\n\nPERIOD = int(PERIOD)\nMAX_OPEN_LONGS = int(MAX_OPEN_LONGS)\nRISK_PERCENT = float(RISK_PERCENT)\n\n_sma_by_symbol: dict[str, list[float]] = {}\n_bar_times_by_symbol: dict[str, list[Any]] = {}\n\n\ndef _clock_symbol() -> str:\n    qc = rt.qc_ohlcv\n    by_sym = rt.qc_ohlcv_by_symbol\n    if qc is not None and by_sym:\n        for sym, q in by_sym.items():\n            if q is qc:\n                return sym\n        if len(by_sym) == 1:\n            return next(iter(by_sym.keys()))\n    return \"UNKNOWN\"\n\n\ndef _active_symbol(symbol: str | None) -> str:\n    s = (symbol or \"\").strip().upper()\n    if s:\n        return s\n    c = _clock_symbol()\n    return c if c != \"UNKNOWN\" else \"DEFAULT\"\n\n\ndef _close0(bar: Any) -> float | None:\n    v = bar.close[0]\n    if v is None:\n        return None\n    return float(v)\n\n\ndef _sma_period(bar: Any, period: int) -> float | None:\n    acc: list[float] = []\n    for i in range(period):\n        v = bar.close[i]\n        if v is None:\n            return None\n        acc.append(float(v))\n    return sum(acc) / period\n\n\ndef _bar_time_raw(bar: Any) -> Any:\n    t0 = bar.t[0]\n    return t0 if t0 is not None else bar.get(\"t\")\n\n\ndef _unwrap_strategy(run_result: Any) -> Any | None:\n    if not run_result:\n        return None\n    first = run_result[0]\n    if isinstance(first, (list, tuple)) and first:\n        return first[0]\n    return first\n\n\nclass _BtSmaCollector(bt.Strategy):\n    params = ((\"period\", 45),)\n\n    def __init__(self):\n        p = max(1, int(self.p.period))\n        self.sma = bt.indicators.SMA(self.data.close, period=p)\n        self.rows: list[tuple[int, float]] = []\n\n    def next(self):\n        v = float(self.sma[0])\n        if not math.isfinite(v) or math.isnan(v):\n            return\n        idx = len(self.data) - 1\n        self.rows.append((idx, v))\n\n\ndef on_init() -> None:\n    print(f\"[smoke_test] PERIOD={PERIOD} | MAX_OPEN_LONGS={MAX_OPEN_LONGS} | RISK_PERCENT={RISK_PERCENT}%\")\n\n\ndef on_tick(\n    bar_index: int,\n    tick_in_bar: int,\n    price: float,\n    bar: Any,\n    fundamentals=None,\n    *,\n    symbol: str | None = None,\n) -> None:\n    _ = (bar_index, tick_in_bar, price, bar, fundamentals, symbol)\n\n\ndef on_bar(\n    bar_index: int,\n    bar: Any,\n    fundamentals=None,\n    *,\n    symbol: str | None = None,\n) -> None:\n    acc = rt.account\n    if acc is None:\n        return\n\n    sym = _active_symbol(symbol)\n    if sym not in _sma_by_symbol:\n        _sma_by_symbol[sym] = []\n        _bar_times_by_symbol[sym] = []\n\n    c = _close0(bar)\n    ma = _sma_period(bar, PERIOD)\n\n    if ma is not None:\n        _sma_by_symbol[sym].append(ma)\n        _bar_times_by_symbol[sym].append(_bar_time_raw(bar))\n\n    if ma is None or c is None:\n        return\n\n    if c < ma:\n        acc.close_all_longs(c, symbol=sym)\n        return\n\n    n_open = len(getattr(acc, \"_positions\", {}))\n    if n_open < MAX_OPEN_LONGS and c > ma:\n        cash = float(acc.cash)\n        if cash <= 0 or c <= 0:\n            return\n        slots = max(1, MAX_OPEN_LONGS - n_open)\n        # RISK_PERCENT % of balance allocated per trade\n        risk_fraction = max(0.0, min(RISK_PERCENT, 100.0)) / 100.0\n        alloc = min(cash * risk_fraction, cash / slots)\n        qty = alloc / c\n        if qty * c <= cash + 1e-6:\n            acc.open_trade(sym, \"long\", qty, c)\n\n\ndef on_timer(bar_index, tick_in_bar, price, bar, fundamentals=None, symbol=None):\n    pass\n\n\ndef on_finish(bars, symbol=None, bars_by_symbol=None) -> None:\n    ci = rt.chart_indicators\n    if ci is None:\n        return\n\n    # Build a per-symbol map of oldest-first bar lists.\n    # Prefer bars_by_symbol (multi-symbol runs); fall back to the single bars list.\n    sources: dict[str, list[dict[str, Any]]] = {}\n    if bars_by_symbol:\n        for sym_key, sym_bars in bars_by_symbol.items():\n            if sym_bars:\n                sources[str(sym_key).upper()] = list(sym_bars)\n    elif bars:\n        key = (symbol or _clock_symbol() or \"clock\").upper()\n        sources[key] = list(bars)\n\n    if not sources:\n        return\n\n    for sym, bars_oldest_first in sources.items():\n        if not bars_oldest_first:\n            continue\n\n        df = pd.DataFrame(bars_oldest_first)\n        if df.empty or \"t\" not in df.columns:\n            continue\n\n        df[\"datetime\"] = pd.to_datetime(df[\"t\"], utc=True, errors=\"coerce\")\n        df = df.dropna(subset=[\"datetime\"]).set_index(\"datetime\")\n        for col in (\"open\", \"high\", \"low\", \"close\", \"volume\"):\n            if col not in df.columns:\n                break\n            df[col] = pd.to_numeric(df[col], errors=\"coerce\")\n        else:\n            df = df.dropna(subset=[\"open\", \"high\", \"low\", \"close\"])\n\n            n = len(df)\n            if n < 1:\n                continue\n\n            period = max(1, min(PERIOD, n))\n\n            cerebro = bt.Cerebro(stdstats=False)\n            cerebro.adddata(bt.feeds.PandasData(dataname=df))\n            cerebro.addstrategy(_BtSmaCollector, period=period)\n\n            strat = _unwrap_strategy(cerebro.run())\n            if strat is None or not getattr(strat, \"rows\", None):\n                continue\n\n            # Map BT SMA values to the same `t` as OHLCV rows (chart alignment).\n            points: list[dict[str, Any]] = []\n            for idx, v in strat.rows:\n                if idx < 0 or idx >= len(bars_oldest_first):\n                    continue\n                raw_t = bars_oldest_first[idx].get(\"t\")\n                ct = coerce_chart_time(raw_t)\n                if ct is None:\n                    continue\n                points.append({\"time\": ct, \"value\": float(v)})\n\n            if not points:\n                continue\n\n            sym_label = sym if sym not in (\"UNKNOWN\", \"DEFAULT\", \"\") else \"clock\"\n            ci.add(\n                points,\n                pane=\"main\",\n                render=\"line\",\n                line_style=\"solid\",\n                id=f\"bt_sma_{period}_{sym_label}\",\n                name=f\"BT SMA({period}) {sym_label}\".strip(),\n                color=\"#ff9800\",\n                symbol=sym if sym not in (\"UNKNOWN\", \"DEFAULT\", \"\") else None,\n            )\n"
+    }
+  ],
+  "externalImportRoots": [
+    "__future__",
+    "backtrader",
+    "math",
+    "pandas",
+    "quantcraft",
+    "typing"
+  ],
+  "idePackages": [
+    {
+      "name": "pandas",
+      "version": "2.3.3"
+    }
+  ],
+  "installedIdePackages": [
+    {
+      "name": "alpaca-py",
+      "version": "0.43.4"
+    },
+    {
+      "name": "debugpy",
+      "version": "1.8.21"
+    },
+    {
+      "name": "financetoolkit",
+      "version": "2.1.0"
+    },
+    {
+      "name": "matplotlib",
+      "version": "3.11.0"
+    },
+    {
+      "name": "numpy",
+      "version": "2.4.6"
+    },
+    {
+      "name": "pandas",
+      "version": "2.3.3"
+    },
+    {
+      "name": "plotly",
+      "version": "6.8.0"
+    },
+    {
+      "name": "pytz",
+      "version": "2026.2"
+    },
+    {
+      "name": "vectorbt",
+      "version": "1.0.0"
+    },
+    {
+      "name": "watchfiles",
+      "version": "1.2.0"
+    }
+  ]
+}

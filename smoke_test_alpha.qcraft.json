@@ -1,0 +1,65 @@
+{
+  "format": "quantcraft-runnable-v1",
+  "createdAt": "2026-04-18T15:58:49.131Z",
+  "entryModulePath": "smoke_test_alpha",
+  "entryFlatFilename": "smoke_test_alpha.py",
+  "files": [
+    {
+      "modulePath": "smoke_test_alpha",
+      "flatFilename": "smoke_test_alpha.py",
+      "content": "\"\"\"\nMA(45) long-only — manual SMA(45) from bar.close[offset].\nRules: close > SMA(45) → add longs (cap 5); close < SMA(45) → flat. No Backtrader.\n\nSymbols from engine only: on_bar / on_tick receive symbol; clock = qc_ohlcv in qc_ohlcv_by_symbol.\n\nUse warmup_bars in the modal so bar.close[44] exists. Optional: fundamentals for B2 prior-quarter.\n\nMulti-symbol: pass symbol= on chart_indicators.add.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport math\nfrom datetime import datetime, timezone\nfrom typing import Any\n\nimport pandas as pd\n\nimport ide.backtest.runtime as rt\nfrom ide.fundamentals_module import BacktestFundamentals\nfrom ide.inputs_module import params\n\nMAX_OPEN_LONGS = params.MAX_OPEN_LONGS\nPERIOD = params.PERIOD\n\n_sma_by_symbol: dict[str, list[float]] = {}\n_bar_times_by_symbol: dict[str, list[Any]] = {}\n\n\ndef _clock_symbol() -> str:\n    qc = rt.qc_ohlcv\n    by_sym = rt.qc_ohlcv_by_symbol\n    if qc is not None and by_sym:\n        for sym, q in by_sym.items():\n            if q is qc:\n                return sym\n        if len(by_sym) == 1:\n            return next(iter(by_sym.keys()))\n    return \"UNKNOWN\"\n\n\ndef _active_symbol(symbol: str | None) -> str:\n    s = (symbol or \"\").strip().upper()\n    if s:\n        return s\n    c = _clock_symbol()\n    return c if c != \"UNKNOWN\" else \"DEFAULT\"\n\n\ndef _series_key(symbol: str | None) -> str:\n    s = _active_symbol(symbol)\n    return s if s not in (\"UNKNOWN\", \"DEFAULT\") else _clock_symbol()\n\n\ndef _close0(bar: Any) -> float | None:\n    v = bar.close[0]\n    if v is None:\n        return None\n    return float(v)\n\n\ndef _sma_45(bar: Any) -> float | None:\n    acc: list[float] = []\n    for i in range(PERIOD):\n        v = bar.close[i]\n        if v is None:\n            return None\n        acc.append(float(v))\n    return sum(acc) / PERIOD\n\n\ndef _bar_time_raw(bar: Any) -> Any:\n    t0 = bar.t[0]\n    return t0 if t0 is not None else bar.get(\"t\")\n\n\ndef _dt_from_bar(bar: Any) -> datetime | None:\n    raw = _bar_time_raw(bar)\n    if raw is None:\n        return None\n    if isinstance(raw, datetime):\n        dt = raw\n        return (\n            dt.replace(tzinfo=timezone.utc)\n            if dt.tzinfo is None\n            else dt.astimezone(timezone.utc)\n        )\n    ts = pd.Timestamp(raw)\n    if pd.isna(ts):\n        return None\n    dt = ts.to_pydatetime()\n    return (\n        dt.replace(tzinfo=timezone.utc)\n        if dt.tzinfo is None\n        else dt.astimezone(timezone.utc)\n    )\n\n\ndef on_init() -> None:\n    if rt.account is None or rt.qc_ohlcv is None:\n        print(\"ma45: runtime not ready\")\n        return\n    n = len(list(reversed(rt.qc_ohlcv.bars)))\n    clk = _clock_symbol()\n    extra = \"\"\n    if rt.qc_ohlcv_by_symbol:\n        extra = f\"; symbols={list(rt.qc_ohlcv_by_symbol.keys())}; clock={clk}\"\n\n\ndef on_tick(\n    bar_index: int,\n    tick_in_bar: int,\n    price: float,\n    bar: Any,\n    fundamentals: BacktestFundamentals | None = None,\n    *,\n    symbol: str | None = None,\n) -> None:\n    acc = rt.account\n    if fundamentals:\n        snap_msft = fundamentals.current(bar.t[0], symbol=\"MSFT\")\n        # print(f\"fundamentals data: {snap_msft}\")\n    npos = len(getattr(acc, \"_positions\", {})) if acc is not None else 0\n    print(bar_index, tick_in_bar, price, bar, symbol, npos)\n    _ = (bar_index, tick_in_bar, price, bar, fundamentals, symbol)\n\n\ndef on_bar(\n    bar_index: int,\n    bar: Any,\n    fundamentals: BacktestFundamentals | None = None,\n    *,\n    symbol: str | None = None,\n) -> None:\n    acc = rt.account\n    npos = len(getattr(acc, \"_positions\", {})) if acc is not None else 0\n    print(\"on bar running\", symbol, npos)\n    global _sma_by_symbol, _bar_times_by_symbol\n\n    sym = _active_symbol(symbol)\n\n    if sym not in _sma_by_symbol:\n        _sma_by_symbol[sym] = []\n        _bar_times_by_symbol[sym] = []\n\n    c = _close0(bar)\n    ma = _sma_45(bar)\n\n    if ma is not None:\n        _sma_by_symbol[sym].append(ma)\n        _bar_times_by_symbol[sym].append(_bar_time_raw(bar))\n\n    if fundamentals is not None:\n        bt = _dt_from_bar(bar)\n        if bt is not None:\n            pq = fundamentals.get_data_with_offset(\n                bt,\n                1,\n                symbol=sym,\n                print_on_shortfall=False,\n            )\n            ta_p = ((pq or {}).get(\"balanceSheet\") or {}).get(\"quarterly\")\n            ta_p = ta_p.get(\"totalAssets\") if isinstance(ta_p, dict) else None\n\n    if acc is None or ma is None or c is None:\n        return\n\n    if c < ma:\n        acc.close_all_longs(c, symbol=sym)\n        print(f\"Trades closed: {sym} {bar.t[0]} price: {c} {bar.close[0]}, ma: {ma}\")\n        return\n\n    n_open = len(getattr(acc, \"_positions\", {}))\n\n    if n_open < MAX_OPEN_LONGS and c > ma:\n        cash = float(acc.cash)\n        if cash <= 0 or c <= 0:\n            return\n        slots = max(1, MAX_OPEN_LONGS - n_open)\n        alloc = min(cash * 0.1, cash / slots)\n        qty = alloc / c\n        if qty * c <= cash + 1e-6:\n            acc.open_trade(sym, \"long\", qty, c)\n\n\ndef on_finish() -> None:\n    from ide.backtest.indicator_series_module import coerce_chart_time\n\n    ci = rt.chart_indicators\n    if ci is None:\n        return\n\n    for sym in sorted(_bar_times_by_symbol.keys()):\n        times = _bar_times_by_symbol.get(sym, [])\n        vals = _sma_by_symbol.get(sym, [])\n        if not times or not vals:\n            continue\n\n        points: list[dict[str, Any]] = []\n        for t, v in zip(times, vals):\n            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):\n                continue\n            ct = coerce_chart_time(t)\n            if ct is None:\n                continue\n            points.append({\"time\": ct, \"value\": float(v)})\n\n        if not points:\n            continue\n\n        ci.add(\n            points,\n            pane=\"main\",\n            render=\"line\",\n            line_style=\"solid\",\n            id=f\"sma_45_{sym}\",\n            name=f\"SMA(45) {sym}\",\n            color=\"#ff9800\",\n            symbol=sym,\n        )\n\n        print(\"Test completed with parameters: \", PERIOD, MAX_OPEN_LONGS)\n\n\ndef on_timer(bar_index, tick_in_bar, price, bar, fundamentals=None, symbol=None):\n    acc = rt.account\n    if fundamentals:\n        snap_msft = fundamentals.current(bar.t[0], symbol=\"MSFT\")\n        print(f\"fundamentals data: {snap_msft}\")\n    npos = len(getattr(acc, \"_positions\", {})) if acc is not None else 0\n    print(\"Timer bar: \", bar_index, tick_in_bar, price, bar, fundamentals, symbol, npos)"
+    }
+  ],
+  "externalImportRoots": [
+    "__future__",
+    "datetime",
+    "ide",
+    "math",
+    "pandas",
+    "typing"
+  ],
+  "idePackages": [
+    {
+      "name": "pandas",
+      "version": "3.0.1"
+    }
+  ],
+  "installedIdePackages": [
+    {
+      "name": "alpaca-py",
+      "version": "0.43.2"
+    },
+    {
+      "name": "backtrader",
+      "version": "1.9.78.123"
+    },
+    {
+      "name": "matplotlib",
+      "version": "3.10.8"
+    },
+    {
+      "name": "numpy",
+      "version": "2.4.3"
+    },
+    {
+      "name": "pandas",
+      "version": "3.0.1"
+    },
+    {
+      "name": "plotly",
+      "version": "6.6.0"
+    },
+    {
+      "name": "polars",
+      "version": "1.39.3"
+    },
+    {
+      "name": "pytz",
+      "version": "2026.1.post1"
+    },
+    {
+      "name": "sqlalchemy",
+      "version": "2.0.48"
+    }
+  ]
+}

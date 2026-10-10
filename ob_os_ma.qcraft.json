@@ -1,0 +1,91 @@
+{
+  "format": "quantcraft-runnable-v1",
+  "createdAt": "2026-09-19T11:28:19.606Z",
+  "entryModulePath": "ob_os_ma",
+  "entryFlatFilename": "ob_os_ma.py",
+  "files": [
+    {
+      "modulePath": "ob_os_ma",
+      "flatFilename": "ob_os_ma.py",
+      "content": "from quantcraft.backtest.runtime import account\nfrom quantcraft.inputs import params\n\nRSI_PERIOD = params.RSI_PERIOD if hasattr(params, \"RSI_PERIOD\") else 14\nOVERSOLD = params.OVERSOLD if hasattr(params, \"OVERSOLD\") else 30.0\nOVERBOUGHT = params.OVERBOUGHT if hasattr(params, \"OVERBOUGHT\") else 70.0\nENTRY_MA = params.ENTRY_MA if hasattr(params, \"ENTRY_MA\") else 20\nEXIT_MA = params.EXIT_MA if hasattr(params, \"EXIT_MA\") else 50\nQTY = params.QTY if hasattr(params, \"QTY\") else 10\n\n_open: dict[str, str] = {}  # symbol -> position_id\n\n\ndef _sma(bar, n):\n    vals = [bar.close[i] for i in range(n)]\n    return None if None in vals else sum(vals) / n\n\n\ndef _rsi(bar, n):\n    closes = [bar.close[i] for i in range(n + 1)]\n    if None in closes:\n        return None\n    gains = losses = 0.0\n    for i in range(n):  # closes[0] is the newest\n        d = closes[i] - closes[i + 1]\n        gains += max(d, 0.0)\n        losses += max(-d, 0.0)\n    if losses == 0:\n        return 100.0\n    return 100.0 - 100.0 / (1.0 + gains / losses)\n\n\ndef on_init(symbols=None):\n    pass\n\n\ndef on_bar(bar_index, bar, fundamentals=None, symbol=None):\n    if account is None:\n        return\n    sym = (symbol or \"AAPL\").upper()\n    px = float(bar[\"close\"])\n    rsi = _rsi(bar, RSI_PERIOD)\n    entry_ma = _sma(bar, ENTRY_MA)\n    exit_ma = _sma(bar, EXIT_MA)\n    if rsi is None or entry_ma is None or exit_ma is None:\n        return  # not enough history yet\n\n    if sym not in _open:\n        if rsi < OVERSOLD and px < entry_ma and QTY * px <= account.cash:\n            snap = account.open_trade(sym, \"long\", QTY, px)\n            _open[sym] = snap[\"open_positions\"][-1][\"id\"]\n    elif rsi > OVERBOUGHT and px > exit_ma:\n        account.close_trade(_open.pop(sym), px)\n\n\ndef on_tick(bar_index, tick_in_bar, price, bar, fundamentals=None, symbol=None):\n    pass\n\n\ndef on_finish(bars, symbol=None, bars_by_symbol=None):\n    if account is None or not bars:\n        return\n    sym = (symbol or \"AAPL\").upper()\n    account.refresh_metrics({sym: float(bars[-1][\"close\"])})\n"
+    }
+  ],
+  "externalImportRoots": [
+    "quantcraft"
+  ],
+  "idePackages": [],
+  "installedIdePackages": [
+    {
+      "name": "alpaca-py",
+      "version": "0.43.4"
+    },
+    {
+      "name": "backtrader",
+      "version": "1.9.78.123"
+    },
+    {
+      "name": "cryptography",
+      "version": "49.0.0"
+    },
+    {
+      "name": "debugpy",
+      "version": "1.8.21"
+    },
+    {
+      "name": "financetoolkit",
+      "version": "2.1.0"
+    },
+    {
+      "name": "matplotlib",
+      "version": "3.11.0"
+    },
+    {
+      "name": "nuitka",
+      "version": "4.1.2"
+    },
+    {
+      "name": "numpy",
+      "version": "2.4.6"
+    },
+    {
+      "name": "ordered-set",
+      "version": "4.1.0"
+    },
+    {
+      "name": "pandas",
+      "version": "2.3.3"
+    },
+    {
+      "name": "plotly",
+      "version": "6.8.0"
+    },
+    {
+      "name": "polars",
+      "version": "1.43.2"
+    },
+    {
+      "name": "pytest-cov",
+      "version": "7.1.0"
+    },
+    {
+      "name": "pytz",
+      "version": "2026.2"
+    },
+    {
+      "name": "sqlalchemy",
+      "version": "2.0.51"
+    },
+    {
+      "name": "vectorbt",
+      "version": "1.0.0"
+    },
+    {
+      "name": "watchfiles",
+      "version": "1.2.0"
+    },
+    {
+      "name": "zstandard",
+      "version": "0.25.0"
+    }
+  ]
+}
